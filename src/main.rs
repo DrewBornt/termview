@@ -1,26 +1,21 @@
-use std::io::{self, stdout};
+use std::io::{self, stdout, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::Engine;
 use clap::Parser;
 use crossterm::{
+    cursor,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    execute, queue,
+    style::{self, SetBackgroundColor, SetForegroundColor},
+    terminal::{self, disable_raw_mode, enable_raw_mode, ClearType},
 };
 use image::imageops::FilterType;
-use image::{DynamicImage, GenericImageView, Rgba};
-use ratatui::{
-    backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
-    Terminal,
-};
+use image::{DynamicImage, GenericImageView};
 
-/// A terminal-based image viewer that renders images using Unicode half-blocks.
-/// Works over SSH, no GUI required.
+/// A terminal-based image viewer using the Kitty graphics protocol.
+/// Displays native pixels — works in foot, kitty, WezTerm, and Windows Terminal.
 #[derive(Parser, Debug)]
 #[command(name = "termview", version, about)]
 struct Args {
@@ -45,7 +40,6 @@ fn is_image_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Collect and sort all image files in a directory.
 fn collect_images(dir: &Path) -> Vec<PathBuf> {
     let mut images: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()
@@ -66,81 +60,223 @@ fn collect_images(dir: &Path) -> Vec<PathBuf> {
     images
 }
 
-/// Render a DynamicImage into a vector of ratatui Lines using half-block characters.
-/// Each terminal row encodes two pixel rows using the upper-half-block character (▀),
-/// with the foreground color as the top pixel and background color as the bottom pixel.
-fn render_image_to_lines(img: &DynamicImage, width: u16, height: u16) -> Vec<Line<'static>> {
-    // Each terminal cell encodes 2 vertical pixels
-    let pixel_rows = height as u32 * 2;
-    let pixel_cols = width as u32;
+// ---------------------------------------------------------------------------
+// Kitty graphics protocol
+// ---------------------------------------------------------------------------
 
-    if pixel_cols == 0 || pixel_rows == 0 {
-        return vec![];
-    }
+/// Delete all kitty graphics placements from the screen.
+fn kitty_clear(out: &mut impl Write) -> io::Result<()> {
+    // a=d (delete), d=A (all placements)
+    write!(out, "\x1b_Ga=d,d=A\x1b\\")?;
+    Ok(())
+}
 
-    // Determine scaling to fit the image within the terminal area while maintaining aspect ratio
+/// Display an image using the Kitty graphics protocol.
+///
+/// The image is transmitted as raw RGBA pixels, chunked into 4096-byte base64
+/// payloads. It is placed at the current cursor position and scaled to fit
+/// within `cols` x `rows` terminal cells.
+fn kitty_display(
+    out: &mut impl Write,
+    img: &DynamicImage,
+    cols: u16,
+    rows: u16,
+    cell_width_px: u16,
+    cell_height_px: u16,
+) -> io::Result<()> {
+    let avail_px_w = cols as u32 * cell_width_px as u32;
+    let avail_px_h = rows as u32 * cell_height_px as u32;
+
     let (img_w, img_h) = img.dimensions();
-    let scale_x = pixel_cols as f64 / img_w as f64;
-    let scale_y = pixel_rows as f64 / img_h as f64;
-    let scale = scale_x.min(scale_y);
 
-    let new_w = ((img_w as f64 * scale) as u32).max(1).min(pixel_cols);
-    let new_h = ((img_h as f64 * scale) as u32).max(1).min(pixel_rows);
+    // Scale to fit while preserving aspect ratio
+    let scale_x = avail_px_w as f64 / img_w as f64;
+    let scale_y = avail_px_h as f64 / img_h as f64;
+    let scale = scale_x.min(scale_y).min(1.0); // don't upscale
 
-    let resized = img.resize_exact(new_w, new_h, FilterType::Triangle);
+    let disp_w = ((img_w as f64 * scale) as u32).max(1);
+    let disp_h = ((img_h as f64 * scale) as u32).max(1);
 
-    // Calculate centering offsets
-    let offset_x = (pixel_cols.saturating_sub(new_w)) / 2;
-    let offset_y = (pixel_rows.saturating_sub(new_h)) / 2;
-
-    let get_pixel = |px: u32, py: u32| -> Option<Rgba<u8>> {
-        if px >= offset_x && py >= offset_y {
-            let ix = px - offset_x;
-            let iy = py - offset_y;
-            if ix < new_w && iy < new_h {
-                return Some(resized.get_pixel(ix, iy));
-            }
-        }
-        None
+    let resized = if disp_w != img_w || disp_h != img_h {
+        img.resize_exact(disp_w, disp_h, FilterType::Lanczos3)
+    } else {
+        img.clone()
     };
 
-    let mut lines = Vec::with_capacity(height as usize);
+    let rgba = resized.to_rgba8();
+    let raw_pixels = rgba.as_raw();
 
-    for row in 0..height as u32 {
-        let top_y = row * 2;
-        let bot_y = row * 2 + 1;
+    // Center the image: compute the column/row offset
+    let img_cols = (disp_w + cell_width_px as u32 - 1) / cell_width_px as u32;
+    let img_rows = (disp_h + cell_height_px as u32 - 1) / cell_height_px as u32;
+    let col_offset = (cols as u32).saturating_sub(img_cols) / 2;
+    let row_offset = (rows as u32).saturating_sub(img_rows) / 2;
 
-        let mut spans = Vec::with_capacity(pixel_cols as usize);
+    // Move cursor to centering position
+    queue!(out, cursor::MoveTo(col_offset as u16, row_offset as u16))?;
 
-        for col in 0..pixel_cols {
-            let top_pixel = get_pixel(col, top_y);
-            let bot_pixel = get_pixel(col, bot_y);
+    // Encode as base64 and send in chunks
+    let b64 = base64::engine::general_purpose::STANDARD.encode(raw_pixels);
+    let chunks: Vec<&str> = b64.as_bytes().chunks(4096).map(|c| {
+        std::str::from_utf8(c).unwrap()
+    }).collect();
 
-            match (top_pixel, bot_pixel) {
-                (Some(tp), Some(bp)) => {
-                    let fg = Color::Rgb(tp[0], tp[1], tp[2]);
-                    let bg = Color::Rgb(bp[0], bp[1], bp[2]);
-                    spans.push(Span::styled("▀", Style::default().fg(fg).bg(bg)));
-                }
-                (Some(tp), None) => {
-                    let fg = Color::Rgb(tp[0], tp[1], tp[2]);
-                    spans.push(Span::styled("▀", Style::default().fg(fg).bg(Color::Black)));
-                }
-                (None, Some(bp)) => {
-                    let bg = Color::Rgb(bp[0], bp[1], bp[2]);
-                    spans.push(Span::styled("▀", Style::default().fg(Color::Black).bg(bg)));
-                }
-                (None, None) => {
-                    spans.push(Span::styled(" ", Style::default()));
+    for (i, chunk) in chunks.iter().enumerate() {
+        let is_first = i == 0;
+        let is_last = i == chunks.len() - 1;
+        let more = if is_last { 0 } else { 1 };
+
+        if is_first {
+            // a=T (transmit and display), f=32 (RGBA), s=width, v=height
+            write!(
+                out,
+                "\x1b_Ga=T,f=32,s={},v={},m={};{}\x1b\\",
+                disp_w, disp_h, more, chunk
+            )?;
+        } else {
+            write!(out, "\x1b_Gm={};{}\x1b\\", more, chunk)?;
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Terminal cell size detection
+// ---------------------------------------------------------------------------
+
+/// Try to detect the pixel dimensions of a terminal cell.
+/// Uses the TIOCGWINSZ ioctl on Linux to get pixel size.
+/// Falls back to reasonable defaults if unavailable.
+fn get_cell_size() -> (u16, u16) {
+    #[cfg(unix)]
+    {
+        use std::mem::MaybeUninit;
+
+        #[repr(C)]
+        struct Winsize {
+            ws_row: u16,
+            ws_col: u16,
+            ws_xpixel: u16,
+            ws_ypixel: u16,
+        }
+
+        unsafe {
+            let mut ws = MaybeUninit::<Winsize>::uninit();
+            // TIOCGWINSZ = 0x5413 on Linux
+            let ret = libc::ioctl(1, 0x5413, ws.as_mut_ptr());
+            if ret == 0 {
+                let ws = ws.assume_init();
+                if ws.ws_xpixel > 0 && ws.ws_ypixel > 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+                    let cw = ws.ws_xpixel / ws.ws_col;
+                    let ch = ws.ws_ypixel / ws.ws_row;
+                    if cw > 0 && ch > 0 {
+                        return (cw, ch);
+                    }
                 }
             }
         }
-
-        lines.push(Line::from(spans));
     }
 
-    lines
+    // Fallback: assume ~8x16 px cells (common for most fonts)
+    (8, 16)
 }
+
+// ---------------------------------------------------------------------------
+// Status bar drawing (manual, no ratatui needed)
+// ---------------------------------------------------------------------------
+
+fn draw_status_bar(
+    out: &mut impl Write,
+    row: u16,
+    cols: u16,
+    left: &str,
+    right: &str,
+) -> io::Result<()> {
+    queue!(out, cursor::MoveTo(0, row))?;
+    queue!(
+        out,
+        SetForegroundColor(style::Color::White),
+        SetBackgroundColor(style::Color::DarkGrey),
+    )?;
+
+    let left_len = left.len().min(cols as usize);
+    let right_len = right.len().min(cols as usize);
+    let pad = (cols as usize).saturating_sub(left_len + right_len);
+
+    write!(out, "{}", &left[..left_len])?;
+    write!(out, "{}", " ".repeat(pad))?;
+    write!(out, "{}", &right[..right_len])?;
+
+    queue!(
+        out,
+        SetForegroundColor(style::Color::Reset),
+        SetBackgroundColor(style::Color::Reset),
+    )?;
+
+    Ok(())
+}
+
+fn draw_help_overlay(out: &mut impl Write, cols: u16, rows: u16) -> io::Result<()> {
+    let help_lines = [
+        "",
+        "  termview — Keyboard Shortcuts",
+        "",
+        "  ← / h       Previous image",
+        "  → / l       Next image",
+        "  Home / g    First image",
+        "  End / G     Last image",
+        "  + / =       Zoom in",
+        "  - / _       Zoom out",
+        "  0           Reset zoom",
+        "  w/a/s/d     Pan (when zoomed)",
+        "  ?           Toggle help",
+        "  q / Esc     Quit",
+        "",
+    ];
+
+    let box_w: u16 = 40;
+    let box_h = help_lines.len() as u16 + 2; // +2 for top/bottom border
+    let start_col = cols.saturating_sub(box_w) / 2;
+    let start_row = rows.saturating_sub(box_h) / 2;
+
+    queue!(
+        out,
+        SetForegroundColor(style::Color::White),
+        SetBackgroundColor(style::Color::Black),
+    )?;
+
+    // Top border
+    queue!(out, cursor::MoveTo(start_col, start_row))?;
+    write!(out, "┌{}┐", "─".repeat((box_w - 2) as usize))?;
+
+    // Content lines
+    for (i, line) in help_lines.iter().enumerate() {
+        let r = start_row + 1 + i as u16;
+        queue!(out, cursor::MoveTo(start_col, r))?;
+        let content_w = (box_w - 2) as usize;
+        let padded = format!("{:<width$}", line, width = content_w);
+        // Truncate if needed
+        let display: String = padded.chars().take(content_w).collect();
+        write!(out, "│{}│", display)?;
+    }
+
+    // Bottom border
+    queue!(out, cursor::MoveTo(start_col, start_row + box_h - 1))?;
+    write!(out, "└{}┘", "─".repeat((box_w - 2) as usize))?;
+
+    queue!(
+        out,
+        SetForegroundColor(style::Color::Reset),
+        SetBackgroundColor(style::Color::Reset),
+    )?;
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
 
 struct App {
     images: Vec<PathBuf>,
@@ -262,7 +398,7 @@ impl App {
         }
     }
 
-    /// Get a cropped/zoomed view of the current image for rendering.
+    /// Get the image view, applying zoom and pan via cropping.
     fn get_view_image(&self) -> Option<DynamicImage> {
         let img = self.current_image.as_ref()?;
 
@@ -271,18 +407,18 @@ impl App {
         }
 
         let (w, h) = img.dimensions();
-        let view_w = (w as f64 / self.zoom) as u32;
-        let view_h = (h as f64 / self.zoom) as u32;
+        let view_w = ((w as f64 / self.zoom) as u32).max(1);
+        let view_h = ((h as f64 / self.zoom) as u32).max(1);
 
         let center_x = (w as f64 / 2.0 + self.pan_x * w as f64).clamp(0.0, w as f64);
         let center_y = (h as f64 / 2.0 + self.pan_y * h as f64).clamp(0.0, h as f64);
 
         let x = (center_x - view_w as f64 / 2.0)
             .max(0.0)
-            .min((w - view_w.min(w)) as f64) as u32;
+            .min((w.saturating_sub(view_w.min(w))) as f64) as u32;
         let y = (center_y - view_h as f64 / 2.0)
             .max(0.0)
-            .min((h - view_h.min(h)) as f64) as u32;
+            .min((h.saturating_sub(view_h.min(h))) as f64) as u32;
 
         let crop_w = view_w.min(w - x);
         let crop_h = view_h.min(h - y);
@@ -295,133 +431,73 @@ impl App {
     }
 }
 
-fn draw(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> io::Result<()> {
-    terminal.draw(|frame| {
-        let size = frame.size();
+// ---------------------------------------------------------------------------
+// Drawing
+// ---------------------------------------------------------------------------
 
-        // Layout: image area + status bar
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),    // image area
-                Constraint::Length(1), // status bar
-            ])
-            .split(size);
+fn draw(out: &mut impl Write, app: &App) -> io::Result<()> {
+    let (cols, rows) = terminal::size()?;
+    let (cell_w, cell_h) = get_cell_size();
 
-        let image_area = chunks[0];
-        let status_area = chunks[1];
+    // Clear screen and delete old kitty images
+    queue!(out, terminal::Clear(ClearType::All))?;
+    kitty_clear(out)?;
 
-        // Render image
-        if let Some(view_img) = app.get_view_image() {
-            let lines = render_image_to_lines(&view_img, image_area.width, image_area.height);
-            let paragraph = Paragraph::new(lines);
-            frame.render_widget(paragraph, image_area);
-        } else if let Some(ref err) = app.error_message {
-            let err_text = Paragraph::new(err.as_str())
-                .style(Style::default().fg(Color::Red))
-                .alignment(Alignment::Center)
-                .wrap(Wrap { trim: false });
-            // Center vertically
-            let vert = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Percentage(40),
-                    Constraint::Min(3),
-                    Constraint::Percentage(40),
-                ])
-                .split(image_area);
-            frame.render_widget(err_text, vert[1]);
-        }
+    let image_rows = rows.saturating_sub(1); // reserve 1 row for status bar
 
-        // Status bar
-        let filename = app.current_filename();
-        let counter = if app.images.is_empty() {
-            "0/0".into()
-        } else {
-            format!("{}/{}", app.index + 1, app.images.len())
-        };
-        let info = app.image_info();
-        let zoom_str = if (app.zoom - 1.0).abs() > 0.01 {
-            format!(" {:.0}%", app.zoom * 100.0)
-        } else {
-            String::new()
-        };
+    // Draw image
+    if let Some(view_img) = app.get_view_image() {
+        kitty_display(out, &view_img, cols, image_rows, cell_w, cell_h)?;
+    } else if let Some(ref err) = app.error_message {
+        let err_row = rows / 2;
+        let err_col = cols.saturating_sub(err.len() as u16) / 2;
+        queue!(
+            out,
+            cursor::MoveTo(err_col, err_row),
+            SetForegroundColor(style::Color::Red),
+        )?;
+        write!(out, "{}", err)?;
+        queue!(out, SetForegroundColor(style::Color::Reset))?;
+    }
 
-        let left = format!(" {} {} {}", filename, info, zoom_str);
-        let right = format!("{} | q:quit ?:help ", counter);
+    // Status bar
+    let filename = app.current_filename();
+    let counter = if app.images.is_empty() {
+        "0/0".into()
+    } else {
+        format!("{}/{}", app.index + 1, app.images.len())
+    };
+    let info = app.image_info();
+    let zoom_str = if (app.zoom - 1.0).abs() > 0.01 {
+        format!(" {:.0}%", app.zoom * 100.0)
+    } else {
+        String::new()
+    };
 
-        let status_width = status_area.width as usize;
-        let pad = status_width.saturating_sub(left.len() + right.len());
+    let left = format!(" {} {} {}", filename, info, zoom_str);
+    let right = format!("{} | q:quit ?:help ", counter);
 
-        let status_line = Line::from(vec![
-            Span::styled(&left, Style::default().fg(Color::White).bg(Color::DarkGray)),
-            Span::styled(
-                " ".repeat(pad),
-                Style::default().bg(Color::DarkGray),
-            ),
-            Span::styled(&right, Style::default().fg(Color::Yellow).bg(Color::DarkGray)),
-        ]);
+    draw_status_bar(out, rows - 1, cols, &left, &right)?;
 
-        let status = Paragraph::new(status_line);
-        frame.render_widget(status, status_area);
+    // Help overlay
+    if app.show_help {
+        draw_help_overlay(out, cols, rows)?;
+    }
 
-        // Help overlay
-        if app.show_help {
-            let help_text = vec![
-                Line::from(""),
-                Line::from(Span::styled(
-                    "  termview — Keyboard Shortcuts  ",
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(""),
-                Line::from("  ← / h       Previous image"),
-                Line::from("  → / l       Next image"),
-                Line::from("  Home / g    First image"),
-                Line::from("  End / G     Last image"),
-                Line::from("  + / =       Zoom in"),
-                Line::from("  - / _       Zoom out"),
-                Line::from("  0           Reset zoom"),
-                Line::from("  w/a/s/d     Pan (when zoomed)"),
-                Line::from("  ?           Toggle help"),
-                Line::from("  q / Esc     Quit"),
-                Line::from(""),
-            ];
+    // Hide cursor
+    queue!(out, cursor::Hide)?;
 
-            let help_height = help_text.len() as u16;
-            let help_width: u16 = 40;
-
-            let x = (size.width.saturating_sub(help_width)) / 2;
-            let y = (size.height.saturating_sub(help_height)) / 2;
-
-            let help_rect = Rect::new(x, y, help_width, help_height);
-
-            // Clear the area behind the popup
-            let clear = Paragraph::new(
-                std::iter::repeat(Line::from(" ".repeat(help_width as usize)))
-                    .take(help_height as usize)
-                    .collect::<Vec<_>>(),
-            )
-            .style(Style::default().bg(Color::Black));
-            frame.render_widget(clear, help_rect);
-
-            let help = Paragraph::new(help_text)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .title(" Help ")
-                        .style(Style::default().fg(Color::White).bg(Color::Black)),
-                )
-                .style(Style::default().fg(Color::White).bg(Color::Black));
-            frame.render_widget(help, help_rect);
-        }
-    })?;
+    out.flush()?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    // Determine the browsing directory and collect images
     let browse_dir = if let Some(ref file) = args.file {
         if file.is_dir() {
             file.clone()
@@ -435,15 +511,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let browse_dir = std::fs::canonicalize(&browse_dir).unwrap_or(browse_dir);
     let images = collect_images(&browse_dir);
 
-    // Find starting index
     let start_index = if let Some(ref file) = args.file {
         if file.is_file() {
             let canonical = std::fs::canonicalize(file).unwrap_or(file.clone());
             images
                 .iter()
-                .position(|p| {
-                    std::fs::canonicalize(p).unwrap_or(p.clone()) == canonical
-                })
+                .position(|p| std::fs::canonicalize(p).unwrap_or(p.clone()) == canonical)
                 .unwrap_or(0)
         } else {
             0
@@ -454,60 +527,77 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Setup terminal
     enable_raw_mode()?;
-    let mut stdout = stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    terminal.clear()?;
+    let mut out = stdout();
+    execute!(
+        out,
+        terminal::EnterAlternateScreen,
+        cursor::Hide,
+    )?;
 
     let mut app = App::new(images, start_index);
 
-    // Main event loop
+    // Initial draw
+    draw(&mut out, &app)?;
+
+    // Event loop
     loop {
-        draw(&mut terminal, &app)?;
-
         if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+            match event::read()? {
+                Event::Key(key) => {
+                    if key.kind != KeyEventKind::Press {
+                        continue;
+                    }
+
+                    let mut needs_redraw = true;
+
+                    match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break,
+                        KeyCode::Char('c')
+                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            break
+                        }
+
+                        KeyCode::Right | KeyCode::Char('l') => app.next(),
+                        KeyCode::Left | KeyCode::Char('h') => app.prev(),
+                        KeyCode::Home | KeyCode::Char('g') => app.first(),
+                        KeyCode::End => app.last(),
+                        KeyCode::Char('G') => app.last(),
+
+                        KeyCode::Char('+') | KeyCode::Char('=') => app.zoom_in(),
+                        KeyCode::Char('-') | KeyCode::Char('_') => app.zoom_out(),
+                        KeyCode::Char('0') => app.zoom_reset(),
+
+                        KeyCode::Char('w') => app.pan(0.0, -0.05),
+                        KeyCode::Char('s') => app.pan(0.0, 0.05),
+                        KeyCode::Char('a') => app.pan(-0.05, 0.0),
+                        KeyCode::Char('d') => app.pan(0.05, 0.0),
+
+                        KeyCode::Char('?') => app.show_help = !app.show_help,
+
+                        _ => needs_redraw = false,
+                    }
+
+                    if needs_redraw {
+                        draw(&mut out, &app)?;
+                    }
                 }
-
-                match key.code {
-                    // Quit
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
-
-                    // Navigation
-                    KeyCode::Right | KeyCode::Char('l') => app.next(),
-                    KeyCode::Left | KeyCode::Char('h') => app.prev(),
-                    KeyCode::Home | KeyCode::Char('g') => app.first(),
-                    KeyCode::End => app.last(),
-                    KeyCode::Char('G') => app.last(),
-
-                    // Zoom
-                    KeyCode::Char('+') | KeyCode::Char('=') => app.zoom_in(),
-                    KeyCode::Char('-') | KeyCode::Char('_') => app.zoom_out(),
-                    KeyCode::Char('0') => app.zoom_reset(),
-
-                    // Pan (when zoomed)
-                    KeyCode::Char('w') => app.pan(0.0, -0.05),
-                    KeyCode::Char('s') => app.pan(0.0, 0.05),
-                    KeyCode::Char('a') => app.pan(-0.05, 0.0),
-                    KeyCode::Char('d') => app.pan(0.05, 0.0),
-
-                    // Help
-                    KeyCode::Char('?') => app.show_help = !app.show_help,
-
-                    _ => {}
+                Event::Resize(_, _) => {
+                    draw(&mut out, &app)?;
                 }
+                _ => {}
             }
         }
     }
 
-    // Restore terminal
+    // Cleanup: delete kitty images, restore terminal
+    kitty_clear(&mut out)?;
+    execute!(
+        out,
+        cursor::Show,
+        terminal::LeaveAlternateScreen,
+    )?;
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
 
     Ok(())
 }

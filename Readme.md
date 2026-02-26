@@ -1,15 +1,27 @@
 # termview
 
-A terminal-based image viewer written in Rust. Renders images using Unicode half-block characters (▀), so it works everywhere — including over SSH sessions with no GUI.
+A terminal-based image viewer written in Rust. Renders images at native pixel resolution using the Kitty graphics protocol — works over SSH.
 
 ## Features
 
-- **Universal rendering** — Uses Unicode half-blocks with 24-bit color, works in any modern terminal
-- **SSH-friendly** — No GUI, X11, or Wayland required
-- **Browse images** — Arrow through all images in a directory
-- **Zoom & pan** — Zoom into details with keyboard controls
-- **Aspect ratio preservation** — Images are centered and scaled to fit
+- **Native pixel rendering** — Uses the Kitty graphics protocol to display actual pixels, not Unicode approximations
+- **SSH-friendly** — No GUI, X11 forwarding, or Wayland required
+- **Browse images** — Arrow through all images in a directory with wraparound
+- **Zoom & pan** — Inspect details with keyboard controls
+- **Aspect ratio preservation** — Images are centered and scaled to fit (never upscaled)
+- **Lanczos3 downscaling** — High quality resize filter
 - **Wide format support** — PNG, JPEG, GIF, BMP, TIFF, WebP, QOI, TGA, ICO, PNM
+
+## Compatible Terminals
+
+The Kitty graphics protocol is supported by:
+
+- **foot** (Wayland — great with Hyprland)
+- **kitty**
+- **WezTerm**
+- **Windows Terminal** (Windows 11 — works for SSH sessions)
+- **Ghostty**
+- **Konsole** (recent versions)
 
 ## Installation
 
@@ -21,7 +33,7 @@ Or build manually:
 
 ```bash
 cargo build --release
-# Binary is at target/release/termview
+# Binary at target/release/termview
 ```
 
 ## Usage
@@ -54,16 +66,9 @@ termview -d ~/Pictures
 
 ## How It Works
 
-Each terminal cell is treated as a 1×2 pixel block using the upper-half-block character `▀`. The foreground color represents the top pixel and the background color represents the bottom pixel. This effectively doubles the vertical resolution compared to using full block characters, giving a surprisingly decent image preview.
+The Kitty graphics protocol sends base64-encoded RGBA pixel data to the terminal via escape sequences (`\033_G...\033\\`). The terminal renders these as actual pixels overlaid on the text grid. This gives you real image quality.
 
-The viewer uses `ratatui` for the TUI framework and the `image` crate for decoding. Images are resized to fit the terminal dimensions while maintaining aspect ratio, using triangle (bilinear) filtering for quality.
-
-## Requirements
-
-- A terminal with 24-bit (truecolor) support for best results
-- UTF-8 support (virtually all modern terminals)
-- Works great with: Kitty, Alacritty, foot, WezTerm, iTerm2, Windows Terminal, GNOME Terminal, etc.
-- Degraded but functional in 256-color terminals
+The image is resized to fit within the terminal's pixel dimensions (detected via `TIOCGWINSZ` ioctl) using Lanczos3 filtering, centered, and transmitted in 4096-byte chunks. Zoom/pan works by cropping the source image before transmission.
 
 ## License
 
